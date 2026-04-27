@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use crate::codex_apps::codex_apps_tools_cache_key;
 use crate::connection_manager::McpConnectionManager;
+use crate::rmcp_client::McpChannelMessageSink;
 use crate::runtime::McpRuntimeEnvironment;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
@@ -240,6 +241,7 @@ pub async fn read_mcp_resource(
         codex_apps_tools_cache_key(auth),
         tool_plugin_provenance(config),
         auth,
+        McpChannelMessageSink::noop(),
     )
     .await;
 
@@ -305,6 +307,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         codex_apps_tools_cache_key(auth),
         tool_plugin_provenance,
         auth,
+        McpChannelMessageSink::noop(),
     )
     .await;
 

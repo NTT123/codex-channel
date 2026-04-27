@@ -126,7 +126,7 @@ pub(crate) struct ElicitationPauseState {
 }
 
 impl ElicitationPauseState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (paused, _rx) = watch::channel(false);
         Self {
             active_count: Arc::new(AtomicUsize::new(0)),
@@ -249,6 +249,30 @@ pub type SendElicitation = Box<
     dyn Fn(RequestId, Elicitation) -> BoxFuture<'static, Result<ElicitationResponse>> + Send + Sync,
 >;
 
+pub const MCP_CHANNEL_CAPABILITY: &str = "codex/channel";
+pub const MCP_CHANNEL_NOTIFICATION_METHOD: &str = "notifications/codex/channel";
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpChannelNotificationParams {
+    pub content: String,
+    #[serde(default, alias = "meta")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default = "default_mcp_channel_trigger_turn")]
+    pub trigger_turn: bool,
+}
+
+fn default_mcp_channel_trigger_turn() -> bool {
+    true
+}
+
+pub type SendMcpChannelNotification =
+    Box<dyn Fn(McpChannelNotificationParams) -> BoxFuture<'static, ()> + Send + Sync>;
+
+pub fn noop_send_mcp_channel_notification() -> SendMcpChannelNotification {
+    Box::new(|_| async {}.boxed())
+}
+
 pub struct ToolWithConnectorId {
     pub tool: Tool,
     pub connector_id: Option<String>,
@@ -340,9 +364,26 @@ impl RmcpClient {
         timeout: Option<Duration>,
         send_elicitation: SendElicitation,
     ) -> Result<InitializeResult> {
+        self.initialize_with_channel_notification_handler(
+            params,
+            timeout,
+            send_elicitation,
+            noop_send_mcp_channel_notification(),
+        )
+        .await
+    }
+
+    pub async fn initialize_with_channel_notification_handler(
+        &self,
+        params: InitializeRequestParams,
+        timeout: Option<Duration>,
+        send_elicitation: SendElicitation,
+        send_mcp_channel_notification: SendMcpChannelNotification,
+    ) -> Result<InitializeResult> {
         let client_service = ElicitationClientService::new(
             params.clone(),
             send_elicitation,
+            send_mcp_channel_notification,
             self.elicitation_pause_state.clone(),
         );
         let pending_transport = {

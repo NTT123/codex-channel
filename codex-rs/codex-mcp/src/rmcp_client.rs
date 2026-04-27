@@ -15,6 +15,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::codex_apps::CachedCodexAppsToolsLoad;
 use crate::codex_apps::CodexAppsToolsCacheContext;
@@ -45,20 +47,26 @@ use codex_config::McpServerTransportConfig;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
 use codex_exec_server::ReqwestHttpClient;
+use codex_protocol::mcp_channel::InboundMcpChannelMessage;
 use codex_protocol::protocol::Event;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
+use codex_rmcp_client::MCP_CHANNEL_CAPABILITY;
+use codex_rmcp_client::McpChannelNotificationParams;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::SendMcpChannelNotification;
 use codex_rmcp_client::StdioServerLauncher;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
 use rmcp::model::ClientCapabilities;
 use rmcp::model::ElicitationCapability;
+use rmcp::model::ExtensionCapabilities;
 use rmcp::model::FormElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerCapabilities;
 use tokio_util::sync::CancellationToken;
 
 /// MCP server capability indicating that Codex should include [`SandboxState`]
@@ -72,6 +80,30 @@ pub(crate) const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
+pub struct McpChannelMessageSink {
+    send: Arc<dyn Fn(InboundMcpChannelMessage) -> BoxFuture<'static, ()> + Send + Sync>,
+}
+
+impl McpChannelMessageSink {
+    pub fn new<F>(send: F) -> Self
+    where
+        F: Fn(InboundMcpChannelMessage) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        Self {
+            send: Arc::new(send),
+        }
+    }
+
+    pub fn noop() -> Self {
+        Self::new(|_| async {}.boxed())
+    }
+
+    async fn send(&self, message: InboundMcpChannelMessage) {
+        (self.send)(message).await;
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
     pub(crate) tools: Vec<ToolInfo>,
@@ -79,6 +111,7 @@ pub(crate) struct ManagedClient {
     pub(crate) tool_timeout: Option<Duration>,
     pub(crate) server_instructions: Option<String>,
     pub(crate) server_supports_sandbox_state_meta_capability: bool,
+    pub(crate) server_supports_mcp_channel_capability: bool,
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
 }
 
@@ -132,6 +165,7 @@ impl AsyncManagedClient {
         tool_plugin_provenance: Arc<ToolPluginProvenance>,
         runtime_environment: McpRuntimeEnvironment,
         runtime_auth_provider: Option<SharedAuthProvider>,
+        mcp_channel_message_sink: McpChannelMessageSink,
     ) -> Self {
         let tool_filter = ToolFilter::from_config(&config);
         let startup_snapshot = load_startup_cached_codex_apps_tools_snapshot(
@@ -170,6 +204,7 @@ impl AsyncManagedClient {
                         tx_event,
                         elicitation_requests,
                         codex_apps_tools_cache_context,
+                        mcp_channel_message_sink,
                     },
                 )
                 .or_cancel(&cancel_token)
@@ -307,6 +342,44 @@ pub(crate) fn elicitation_capability_for_server(
     })
 }
 
+fn server_supports_experimental_capability(
+    capabilities: &ServerCapabilities,
+    capability: &str,
+) -> bool {
+    capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key(capability))
+}
+
+pub(crate) fn mcp_channel_notification_sender(
+    server_name: String,
+    sink: McpChannelMessageSink,
+) -> SendMcpChannelNotification {
+    Box::new(move |params: McpChannelNotificationParams| {
+        let server_name = server_name.clone();
+        let sink = sink.clone();
+        async move {
+            sink.send(InboundMcpChannelMessage {
+                server_name,
+                content: params.content,
+                metadata: params.metadata,
+                received_at: unix_timestamp_seconds(),
+                trigger_turn: params.trigger_turn,
+            })
+            .await;
+        }
+        .boxed()
+    })
+}
+
+pub(crate) fn unix_timestamp_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 pub(crate) async fn list_tools_for_client_uncached(
     server_name: &str,
     client: &Arc<RmcpClient>,
@@ -409,13 +482,16 @@ async fn start_server_task(
         tx_event,
         elicitation_requests,
         codex_apps_tools_cache_context,
+        mcp_channel_message_sink,
     } = params;
     let elicitation = elicitation_capability_for_server(&server_name);
+    let mut extensions = ExtensionCapabilities::new();
+    extensions.insert(MCP_CHANNEL_CAPABILITY.to_string(), Default::default());
     let params = InitializeRequestParams {
         meta: None,
         capabilities: ClientCapabilities {
             experimental: None,
-            extensions: None,
+            extensions: Some(extensions),
             roots: None,
             sampling: None,
             elicitation,
@@ -433,18 +509,35 @@ async fn start_server_task(
     };
 
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
+    let send_mcp_channel_notification =
+        mcp_channel_notification_sender(server_name.clone(), mcp_channel_message_sink);
 
     let initialize_result = client
-        .initialize(params, startup_timeout, send_elicitation)
+        .initialize_with_channel_notification_handler(
+            params,
+            startup_timeout,
+            send_elicitation,
+            send_mcp_channel_notification,
+        )
         .await
         .map_err(StartupOutcomeError::from)?;
 
-    let server_supports_sandbox_state_meta_capability = initialize_result
+    let server_supports_sandbox_state_meta_capability = server_supports_experimental_capability(
+        &initialize_result.capabilities,
+        MCP_SANDBOX_STATE_META_CAPABILITY,
+    );
+    let server_supports_mcp_channel_capability = initialize_result
         .capabilities
-        .experimental
+        .extensions
         .as_ref()
-        .and_then(|exp| exp.get(MCP_SANDBOX_STATE_META_CAPABILITY))
-        .is_some();
+        .is_some_and(|extensions| extensions.contains_key(MCP_CHANNEL_CAPABILITY))
+        || server_supports_experimental_capability(
+            &initialize_result.capabilities,
+            MCP_CHANNEL_CAPABILITY,
+        );
+    if server_supports_mcp_channel_capability {
+        tracing::debug!("MCP server `{server_name}` supports `{MCP_CHANNEL_CAPABILITY}`");
+    }
     let list_start = Instant::now();
     let fetch_start = Instant::now();
     let tools = list_tools_for_client_uncached(
@@ -481,6 +574,7 @@ async fn start_server_task(
         tool_filter,
         server_instructions: initialize_result.instructions,
         server_supports_sandbox_state_meta_capability,
+        server_supports_mcp_channel_capability,
         codex_apps_tools_cache_context,
     };
 
@@ -494,6 +588,7 @@ struct StartServerTaskParams {
     tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
+    mcp_channel_message_sink: McpChannelMessageSink,
 }
 
 async fn make_rmcp_client(

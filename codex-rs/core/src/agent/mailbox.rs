@@ -1,3 +1,8 @@
+use crate::context::ContextualUserFragment;
+use crate::context::McpChannelMessage;
+use codex_protocol::mcp_channel::InboundMcpChannelMessage;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
@@ -8,15 +13,57 @@ use tokio::sync::watch;
 #[cfg(test)]
 use codex_protocol::AgentPath;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MailboxItem {
+    InterAgent(InterAgentCommunication),
+    McpChannel(InboundMcpChannelMessage),
+}
+
 pub(crate) struct Mailbox {
-    tx: mpsc::UnboundedSender<InterAgentCommunication>,
+    tx: mpsc::UnboundedSender<MailboxItem>,
     next_seq: AtomicU64,
     seq_tx: watch::Sender<u64>,
 }
 
 pub(crate) struct MailboxReceiver {
-    rx: mpsc::UnboundedReceiver<InterAgentCommunication>,
-    pending_mails: VecDeque<InterAgentCommunication>,
+    rx: mpsc::UnboundedReceiver<MailboxItem>,
+    pending_mails: VecDeque<MailboxItem>,
+}
+
+impl MailboxItem {
+    pub(crate) fn trigger_turn(&self) -> bool {
+        match self {
+            MailboxItem::InterAgent(communication) => communication.trigger_turn,
+            MailboxItem::McpChannel(message) => message.trigger_turn,
+        }
+    }
+
+    pub(crate) fn to_response_input_item(&self) -> ResponseInputItem {
+        match self {
+            MailboxItem::InterAgent(communication) => communication.to_response_input_item(),
+            MailboxItem::McpChannel(message) => ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: McpChannelMessage {
+                        message: message.clone(),
+                    }
+                    .render(),
+                }],
+            },
+        }
+    }
+}
+
+impl From<InterAgentCommunication> for MailboxItem {
+    fn from(value: InterAgentCommunication) -> Self {
+        Self::InterAgent(value)
+    }
+}
+
+impl From<InboundMcpChannelMessage> for MailboxItem {
+    fn from(value: InboundMcpChannelMessage) -> Self {
+        Self::McpChannel(value)
+    }
 }
 
 impl Mailbox {
@@ -40,9 +87,9 @@ impl Mailbox {
         self.seq_tx.subscribe()
     }
 
-    pub(crate) fn send(&self, communication: InterAgentCommunication) -> u64 {
+    pub(crate) fn send(&self, item: impl Into<MailboxItem>) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.tx.send(communication);
+        let _ = self.tx.send(item.into());
         self.seq_tx.send_replace(seq);
         seq
     }
@@ -62,10 +109,10 @@ impl MailboxReceiver {
 
     pub(crate) fn has_pending_trigger_turn(&mut self) -> bool {
         self.sync_pending_mails();
-        self.pending_mails.iter().any(|mail| mail.trigger_turn)
+        self.pending_mails.iter().any(MailboxItem::trigger_turn)
     }
 
-    pub(crate) fn drain(&mut self) -> Vec<InterAgentCommunication> {
+    pub(crate) fn drain(&mut self) -> Vec<MailboxItem> {
         self.sync_pending_mails();
         self.pending_mails.drain(..).collect()
     }
@@ -89,6 +136,16 @@ mod tests {
             content.to_string(),
             trigger_turn,
         )
+    }
+
+    fn make_channel_message(content: &str, trigger_turn: bool) -> InboundMcpChannelMessage {
+        InboundMcpChannelMessage {
+            server_name: "linear".to_string(),
+            content: content.to_string(),
+            metadata: None,
+            received_at: 1_726_000_001,
+            trigger_turn,
+        }
     }
 
     #[tokio::test]
@@ -134,8 +191,37 @@ mod tests {
         mailbox.send(mail_one.clone());
         mailbox.send(mail_two.clone());
 
-        assert_eq!(receiver.drain(), vec![mail_one, mail_two]);
+        assert_eq!(
+            receiver.drain(),
+            vec![
+                MailboxItem::InterAgent(mail_one),
+                MailboxItem::InterAgent(mail_two)
+            ]
+        );
         assert!(!receiver.has_pending());
+    }
+
+    #[tokio::test]
+    async fn mailbox_drains_mixed_items_in_delivery_order() {
+        let (mailbox, mut receiver) = Mailbox::new();
+        let mail = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "inter-agent",
+            /*trigger_turn*/ false,
+        );
+        let channel_message = make_channel_message("mcp channel", /*trigger_turn*/ false);
+
+        mailbox.send(mail.clone());
+        mailbox.send(channel_message.clone());
+
+        assert_eq!(
+            receiver.drain(),
+            vec![
+                MailboxItem::InterAgent(mail),
+                MailboxItem::McpChannel(channel_message)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -157,5 +243,50 @@ mod tests {
             /*trigger_turn*/ true,
         ));
         assert!(receiver.has_pending_trigger_turn());
+    }
+
+    #[tokio::test]
+    async fn mailbox_tracks_pending_trigger_turn_channel_message() {
+        let (mailbox, mut receiver) = Mailbox::new();
+
+        mailbox.send(make_channel_message("queued", /*trigger_turn*/ false));
+        assert!(!receiver.has_pending_trigger_turn());
+
+        mailbox.send(make_channel_message("wake", /*trigger_turn*/ true));
+        assert!(receiver.has_pending_trigger_turn());
+    }
+
+    #[test]
+    fn inter_agent_item_converts_to_existing_assistant_envelope() {
+        let mail = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "hello",
+            /*trigger_turn*/ false,
+        );
+
+        assert_eq!(
+            MailboxItem::InterAgent(mail.clone()).to_response_input_item(),
+            mail.to_response_input_item()
+        );
+    }
+
+    #[test]
+    fn mcp_channel_item_converts_to_user_input_text_fragment() {
+        let channel_message = make_channel_message("mcp channel", /*trigger_turn*/ true);
+
+        let item = MailboxItem::McpChannel(channel_message).to_response_input_item();
+
+        let ResponseInputItem::Message { role, content } = item else {
+            panic!("expected message input");
+        };
+        assert_eq!(role, "user");
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected one input_text item, got {content:#?}");
+        };
+        assert!(text.starts_with("<mcp_channel_message>"));
+        assert!(text.ends_with("</mcp_channel_message>"));
+        assert!(!text.contains("trigger_turn"));
+        assert!(InterAgentCommunication::from_message_content(&content).is_none());
     }
 }

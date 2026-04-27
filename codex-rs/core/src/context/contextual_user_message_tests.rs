@@ -2,7 +2,10 @@ use super::*;
 use crate::context::ContextualUserFragment;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+use codex_protocol::mcp_channel::InboundMcpChannelMessage;
 use codex_protocol::models::ResponseItem;
+use pretty_assertions::assert_eq;
+use serde_json::json;
 
 #[test]
 fn detects_environment_context_fragment() {
@@ -24,6 +27,31 @@ fn detects_subagent_notification_fragment_case_insensitively() {
     assert!(SubagentNotification::matches_text(
         "<SUBAGENT_NOTIFICATION>{}</subagent_notification>"
     ));
+}
+
+#[test]
+fn detects_mcp_channel_message_fragment_case_insensitively() {
+    assert!(McpChannelMessage::matches_text(
+        "<MCP_CHANNEL_MESSAGE>{}</mcp_channel_message>"
+    ));
+}
+
+#[test]
+fn recognizes_mcp_channel_message_as_contextual_and_memory_visible() {
+    let text = McpChannelMessage {
+        message: InboundMcpChannelMessage {
+            server_name: "slack".to_string(),
+            content: "Reply needed".to_string(),
+            metadata: Some(json!({"thread": "abc"})),
+            received_at: 1_726_000_001,
+            trigger_turn: false,
+        },
+    }
+    .render();
+    let content_item = ContentItem::InputText { text };
+
+    assert!(is_contextual_user_fragment(&content_item));
+    assert!(!is_memory_excluded_contextual_user_fragment(&content_item));
 }
 
 #[test]
@@ -50,6 +78,10 @@ fn classifies_memory_excluded_fragments() {
         ),
         (
             "<subagent_notification>{\"agent_id\":\"a\",\"status\":\"completed\"}</subagent_notification>",
+            false,
+        ),
+        (
+            "<mcp_channel_message>{\"server_name\":\"slack\",\"content\":\"hello\",\"metadata\":null,\"received_at\":1726000001}</mcp_channel_message>",
             false,
         ),
     ];

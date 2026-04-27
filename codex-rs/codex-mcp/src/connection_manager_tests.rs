@@ -9,8 +9,11 @@ use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::elicitation_is_rejected_by_policy;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::ManagedClient;
+use crate::rmcp_client::McpChannelMessageSink;
 use crate::rmcp_client::StartupOutcomeError;
 use crate::rmcp_client::elicitation_capability_for_server;
+use crate::rmcp_client::mcp_channel_notification_sender;
+use crate::rmcp_client::unix_timestamp_seconds;
 use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
@@ -18,9 +21,12 @@ use crate::tools::qualify_tools;
 use crate::tools::tool_with_model_visible_input_schema;
 use codex_config::Constrained;
 use codex_protocol::ToolName;
+use codex_protocol::mcp_channel::InboundMcpChannelMessage;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::McpAuthStatus;
+use codex_rmcp_client::MCP_CHANNEL_CAPABILITY;
+use codex_rmcp_client::McpChannelNotificationParams;
 use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use rmcp::model::CreateElicitationRequestParams;
@@ -86,6 +92,251 @@ fn create_codex_apps_tools_cache_context(
         },
     }
 }
+
+#[tokio::test]
+async fn mcp_channel_notification_sender_attaches_server_and_timestamp() {
+    let (tx, rx) = async_channel::bounded(1);
+    let sink = McpChannelMessageSink::new(move |message| {
+        let tx = tx.clone();
+        async move {
+            tx.send(message).await.expect("receiver should be open");
+        }
+        .boxed()
+    });
+    let sender = mcp_channel_notification_sender("slack".to_string(), sink);
+
+    let before = unix_timestamp_seconds();
+    sender(McpChannelNotificationParams {
+        content: "hello".to_string(),
+        metadata: Some(serde_json::json!({ "sender": "alice" })),
+        trigger_turn: false,
+    })
+    .await;
+    let after = unix_timestamp_seconds();
+
+    let message = rx.recv().await.expect("sink should receive message");
+    assert_eq!(
+        message,
+        InboundMcpChannelMessage {
+            server_name: "slack".to_string(),
+            content: "hello".to_string(),
+            metadata: Some(serde_json::json!({ "sender": "alice" })),
+            received_at: message.received_at,
+            trigger_turn: false,
+        }
+    );
+    assert!(
+        (before..=after).contains(&message.received_at),
+        "received_at {} should be between {before} and {after}",
+        message.received_at
+    );
+}
+
+#[tokio::test]
+async fn mcp_channel_noop_sink_drops_message() {
+    let sender =
+        mcp_channel_notification_sender("slack".to_string(), McpChannelMessageSink::noop());
+
+    sender(McpChannelNotificationParams {
+        content: "hello".to_string(),
+        metadata: None,
+        trigger_turn: true,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() -> anyhow::Result<()>
+{
+    const SERVER_NAME: &str = "channel_server";
+    const INIT_PARAMS_PATH_ENV: &str = "CODEX_MCP_CHANNEL_INIT_PARAMS_PATH";
+
+    let temp = tempdir()?;
+    let init_params_path = temp.path().join("initialize.json");
+    let server_script_path = temp.path().join("mcp_channel_stdio_server.py");
+    std::fs::write(&server_script_path, MCP_CHANNEL_STDIO_SERVER_SCRIPT)?;
+    let mut servers = HashMap::new();
+    servers.insert(
+        SERVER_NAME.to_string(),
+        McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: "python3".to_string(),
+                args: vec![server_script_path.to_string_lossy().into_owned()],
+                env: Some(HashMap::from([(
+                    INIT_PARAMS_PATH_ENV.to_string(),
+                    init_params_path.to_string_lossy().into_owned(),
+                )])),
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+            experimental_environment: None,
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            disabled_reason: None,
+            startup_timeout_sec: Some(Duration::from_secs(5)),
+            tool_timeout_sec: Some(Duration::from_secs(5)),
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        },
+    );
+    let (tx_event, _rx_event) = async_channel::bounded(8);
+    let (tx_message, rx_message) = async_channel::bounded(1);
+    let sink = McpChannelMessageSink::new(move |message| {
+        let tx_message = tx_message.clone();
+        async move {
+            tx_message
+                .send(message)
+                .await
+                .expect("receiver should be open");
+        }
+        .boxed()
+    });
+    let approval_policy = Constrained::allow_any(AskForApproval::Never);
+    let before = unix_timestamp_seconds();
+
+    let (manager, cancel_token) = McpConnectionManager::new(
+        &servers,
+        OAuthCredentialsStoreMode::Auto,
+        HashMap::new(),
+        &approval_policy,
+        "submit-1".to_string(),
+        tx_event,
+        PermissionProfile::default(),
+        McpRuntimeEnvironment::new(
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            std::env::current_dir()?,
+        ),
+        temp.path().to_path_buf(),
+        CodexAppsToolsCacheKey {
+            account_id: None,
+            chatgpt_user_id: None,
+            is_workspace_account: false,
+        },
+        ToolPluginProvenance::default(),
+        /*auth*/ None,
+        sink,
+    )
+    .await;
+
+    assert!(
+        manager
+            .wait_for_server_ready(SERVER_NAME, Duration::from_secs(10))
+            .await,
+        "test MCP server should become ready"
+    );
+    assert_eq!(
+        manager
+            .server_supports_mcp_channel_capability(SERVER_NAME)
+            .await?,
+        true
+    );
+
+    let message = tokio::time::timeout(Duration::from_secs(5), rx_message.recv()).await??;
+    let after = unix_timestamp_seconds();
+    assert_eq!(
+        message,
+        InboundMcpChannelMessage {
+            server_name: SERVER_NAME.to_string(),
+            content: "manager hello".to_string(),
+            metadata: Some(serde_json::json!({ "sender": "stdio-test" })),
+            received_at: message.received_at,
+            trigger_turn: false,
+        }
+    );
+    assert!(
+        (before..=after).contains(&message.received_at),
+        "received_at {} should be between {before} and {after}",
+        message.received_at
+    );
+
+    let init_params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(init_params_path)?)?;
+    assert_eq!(
+        init_params["capabilities"]["extensions"][MCP_CHANNEL_CAPABILITY],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        init_params["capabilities"]
+            .get("experimental")
+            .and_then(|experimental| experimental.get(MCP_CHANNEL_CAPABILITY)),
+        None
+    );
+
+    cancel_token.cancel();
+    Ok(())
+}
+
+const MCP_CHANNEL_STDIO_SERVER_SCRIPT: &str = r#"
+import json
+import os
+import sys
+
+INIT_PARAMS_PATH_ENV = "CODEX_MCP_CHANNEL_INIT_PARAMS_PATH"
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        path = os.environ.get(INIT_PARAMS_PATH_ENV)
+        if path:
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(message.get("params"), file, separators=(",", ":"))
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "extensions": {"codex/channel": {}},
+                    "experimental": {"codex/sandbox-state-meta": {}},
+                    "tools": {"listChanged": True}
+                },
+                "serverInfo": {
+                    "name": "mcp-channel-test",
+                    "version": "0.0.0"
+                }
+            }
+        })
+    elif method == "notifications/initialized":
+        send({
+            "jsonrpc": "2.0",
+            "method": "notifications/codex/channel",
+            "params": {
+                "content": "manager hello",
+                "metadata": {"sender": "stdio-test"},
+                "triggerTurn": False
+            }
+        })
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": []
+            }
+        })
+    elif request_id is not None:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": "method not found"
+            }
+        })
+"#;
 
 #[test]
 fn declared_openai_file_fields_treat_names_literally() {
