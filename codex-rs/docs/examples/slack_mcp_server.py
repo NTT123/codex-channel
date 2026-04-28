@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import threading
+import urllib.request
 from typing import Any
 
 from slack_sdk import WebClient
@@ -43,6 +44,8 @@ CHANNEL_CAPABILITY = "codex/channel"
 CHANNEL_NOTIFICATION_METHOD = "notifications/codex/channel"
 TOOL_SEND_MESSAGE = "send_slack_message"
 TOOL_API_CALL = "slack_api_call"
+TOOL_DOWNLOAD_FILE = "slack_download_file"
+DEFAULT_DOWNLOAD_MAX_BYTES = 5_000_000
 
 _stdout_lock = threading.Lock()
 _socket_client: SocketModeClient | None = None
@@ -163,14 +166,62 @@ def tools_result() -> dict[str, Any]:
                 },
             },
             {
+                "name": TOOL_DOWNLOAD_FILE,
+                "description": (
+                    "Download a Slack file to a local path. Inbound "
+                    "messages list attached files under metadata.files; "
+                    "pass the entry's url_private as `url` and choose a "
+                    "destination via `path`. File downloads aren't Web "
+                    "API methods (they require an authenticated GET to "
+                    f"files.slack.com), so use this rather than "
+                    f"`{TOOL_API_CALL}`. After download, open the path "
+                    "with `view_image` (for images) or shell tools (for "
+                    "anything else). Default cap "
+                    f"{DEFAULT_DOWNLOAD_MAX_BYTES} bytes; override with "
+                    "max_bytes. Requires files:read on the bot token."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": (
+                                "url_private or url_private_download from "
+                                "a Slack file object."
+                            ),
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Destination file path. The parent "
+                                "directory must exist; an existing file "
+                                "at this path will be overwritten."
+                            ),
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": (
+                                "Maximum bytes to write. `truncated: "
+                                "true` is set if the file is larger. "
+                                f"Default {DEFAULT_DOWNLOAD_MAX_BYTES}."
+                            ),
+                            "minimum": 1,
+                        },
+                    },
+                    "required": ["url", "path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": TOOL_API_CALL,
                 "description": (
                     "Invoke any Slack Web API method "
                     "(https://api.slack.com/methods) — e.g. "
                     "conversations.history, reactions.add, files.upload, "
                     "chat.update. Use this for anything not covered by "
-                    f"`{TOOL_SEND_MESSAGE}`. Pass a small `limit` for "
-                    "paginated reads to keep responses compact."
+                    f"`{TOOL_SEND_MESSAGE}` or `{TOOL_DOWNLOAD_FILE}`. Pass "
+                    "a small `limit` for paginated reads to keep responses "
+                    "compact."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -217,6 +268,8 @@ def handle_tool_call(request_id: Any, params: dict[str, Any]) -> None:
         handle_send_message(request_id, args)
     elif name == TOOL_API_CALL:
         handle_api_call(request_id, args)
+    elif name == TOOL_DOWNLOAD_FILE:
+        handle_download_file(request_id, args)
     else:
         send_error(request_id, -32601, f"unknown tool: {name}")
 
@@ -298,6 +351,72 @@ def handle_api_call(request_id: Any, args: dict[str, Any]) -> None:
             "content": [{"type": "text", "text": summary}],
             "structuredContent": data,
             "isError": not ok,
+        },
+    )
+
+
+def handle_download_file(request_id: Any, args: dict[str, Any]) -> None:
+    url = args.get("url")
+    if not isinstance(url, str) or not url:
+        send_error(request_id, -32602, "url must be a non-empty string")
+        return
+
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        send_error(request_id, -32602, "path must be a non-empty string")
+        return
+
+    max_bytes = args.get("max_bytes", DEFAULT_DOWNLOAD_MAX_BYTES)
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        send_error(request_id, -32602, "max_bytes must be a positive integer")
+        return
+
+    # Slack file URLs (`url_private`, `url_private_download`) live on
+    # files.slack.com and require the bot token as a Bearer header — they're
+    # not Web API methods. Reuse the SDK's token but make the GET ourselves.
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {_web_client.token}"},
+    )
+    written = 0
+    truncated = False
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response, open(
+            path, "wb"
+        ) as out:
+            content_type = response.headers.get(
+                "Content-Type", "application/octet-stream"
+            )
+            remaining = max_bytes
+            while remaining > 0:
+                chunk = response.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                written += len(chunk)
+                remaining -= len(chunk)
+            # Probe one more byte to detect truncation without buffering it.
+            if response.read(1):
+                truncated = True
+    except Exception as exc:  # noqa: BLE001
+        send_error(request_id, -32000, f"Slack file download error: {exc}")
+        return
+
+    summary = f"saved {written} bytes ({content_type}) to {path}"
+    if truncated:
+        summary += f"; truncated at max_bytes={max_bytes}"
+    send_response(
+        request_id,
+        {
+            "content": [{"type": "text", "text": summary}],
+            "structuredContent": {
+                "url": url,
+                "path": path,
+                "content_type": content_type,
+                "size_bytes": written,
+                "truncated": truncated,
+            },
+            "isError": False,
         },
     )
 
