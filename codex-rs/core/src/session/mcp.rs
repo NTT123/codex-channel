@@ -245,7 +245,7 @@ impl Session {
             codex_apps_tools_cache_key(auth.as_ref()),
             tool_plugin_provenance,
             auth.as_ref(),
-            mcp_channel_message_sink_for_session(self),
+            mcp_channel_message_sink_for_session(self, &turn_context.session_source),
         )
         .await;
         {
@@ -326,9 +326,17 @@ impl Session {
 
 pub(super) fn mcp_channel_message_sink_for_session(
     session: &Arc<Session>,
-) -> codex_mcp::McpChannelMessageSink {
+    session_source: &SessionSource,
+) -> Option<codex_mcp::McpChannelMessageSink> {
+    // Sub-agents share the parent's MCP server set; if each one also subscribed
+    // to inbound channel notifications they would receive duplicates. Only the
+    // root session subscribes — if the root wants a sub-agent to act on a
+    // message, it forwards explicitly.
+    if matches!(session_source, SessionSource::SubAgent(_)) {
+        return None;
+    }
     let weak_session = Arc::downgrade(session);
-    codex_mcp::McpChannelMessageSink::new(move |message| {
+    Some(codex_mcp::McpChannelMessageSink::new(move |message| {
         let weak_session = weak_session.clone();
         async move {
             let Some(session) = weak_session.upgrade() else {
@@ -337,5 +345,5 @@ pub(super) fn mcp_channel_message_sink_for_session(
             session.handle_mcp_channel_message(message).await;
         }
         .boxed()
-    })
+    }))
 }

@@ -39,6 +39,7 @@ use rmcp::model::NumberOrString;
 use rmcp::model::Tool;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tempfile::TempDir;
 use tempfile::tempdir;
 
 fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
@@ -103,7 +104,7 @@ async fn mcp_channel_notification_sender_attaches_server_and_timestamp() {
         }
         .boxed()
     });
-    let sender = mcp_channel_notification_sender("slack".to_string(), sink);
+    let sender = mcp_channel_notification_sender("slack".to_string(), Some(sink));
 
     let before = unix_timestamp_seconds();
     sender(McpChannelNotificationParams {
@@ -133,9 +134,8 @@ async fn mcp_channel_notification_sender_attaches_server_and_timestamp() {
 }
 
 #[tokio::test]
-async fn mcp_channel_noop_sink_drops_message() {
-    let sender =
-        mcp_channel_notification_sender("slack".to_string(), McpChannelMessageSink::noop());
+async fn mcp_channel_notification_sender_with_no_sink_drops_message() {
+    let sender = mcp_channel_notification_sender("slack".to_string(), None);
 
     sender(McpChannelNotificationParams {
         content: "hello".to_string(),
@@ -145,10 +145,19 @@ async fn mcp_channel_noop_sink_drops_message() {
     .await;
 }
 
-#[tokio::test]
-async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() -> anyhow::Result<()>
-{
-    const SERVER_NAME: &str = "channel_server";
+const MCP_CHANNEL_TEST_SERVER_NAME: &str = "channel_server";
+
+struct McpChannelTestHarness {
+    _temp: TempDir,
+    _rx_event: async_channel::Receiver<Event>,
+    init_params_path: PathBuf,
+    manager: McpConnectionManager,
+    cancel_token: CancellationToken,
+}
+
+async fn spawn_mcp_channel_test_manager(
+    sink: Option<McpChannelMessageSink>,
+) -> anyhow::Result<McpChannelTestHarness> {
     const INIT_PARAMS_PATH_ENV: &str = "CODEX_MCP_CHANNEL_INIT_PARAMS_PATH";
 
     let temp = tempdir()?;
@@ -157,7 +166,7 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
     std::fs::write(&server_script_path, MCP_CHANNEL_STDIO_SERVER_SCRIPT)?;
     let mut servers = HashMap::new();
     servers.insert(
-        SERVER_NAME.to_string(),
+        MCP_CHANNEL_TEST_SERVER_NAME.to_string(),
         McpServerConfig {
             transport: McpServerTransportConfig::Stdio {
                 command: "python3".to_string(),
@@ -184,21 +193,8 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
             tools: HashMap::new(),
         },
     );
-    let (tx_event, _rx_event) = async_channel::bounded(8);
-    let (tx_message, rx_message) = async_channel::bounded(1);
-    let sink = McpChannelMessageSink::new(move |message| {
-        let tx_message = tx_message.clone();
-        async move {
-            tx_message
-                .send(message)
-                .await
-                .expect("receiver should be open");
-        }
-        .boxed()
-    });
+    let (tx_event, rx_event) = async_channel::bounded(8);
     let approval_policy = Constrained::allow_any(AskForApproval::Never);
-    let before = unix_timestamp_seconds();
-
     let (manager, cancel_token) = McpConnectionManager::new(
         &servers,
         OAuthCredentialsStoreMode::Auto,
@@ -223,15 +219,43 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
     )
     .await;
 
+    Ok(McpChannelTestHarness {
+        _temp: temp,
+        _rx_event: rx_event,
+        init_params_path,
+        manager,
+        cancel_token,
+    })
+}
+
+#[tokio::test]
+async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() -> anyhow::Result<()>
+{
+    let (tx_message, rx_message) = async_channel::bounded(1);
+    let sink = McpChannelMessageSink::new(move |message| {
+        let tx_message = tx_message.clone();
+        async move {
+            tx_message
+                .send(message)
+                .await
+                .expect("receiver should be open");
+        }
+        .boxed()
+    });
+    let before = unix_timestamp_seconds();
+    let harness = spawn_mcp_channel_test_manager(Some(sink)).await?;
+
     assert!(
-        manager
-            .wait_for_server_ready(SERVER_NAME, Duration::from_secs(10))
+        harness
+            .manager
+            .wait_for_server_ready(MCP_CHANNEL_TEST_SERVER_NAME, Duration::from_secs(10))
             .await,
         "test MCP server should become ready"
     );
     assert_eq!(
-        manager
-            .server_supports_mcp_channel_capability(SERVER_NAME)
+        harness
+            .manager
+            .server_supports_mcp_channel_capability(MCP_CHANNEL_TEST_SERVER_NAME)
             .await?,
         true
     );
@@ -241,7 +265,7 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
     assert_eq!(
         message,
         InboundMcpChannelMessage {
-            server_name: SERVER_NAME.to_string(),
+            server_name: MCP_CHANNEL_TEST_SERVER_NAME.to_string(),
             content: "manager hello".to_string(),
             metadata: Some(serde_json::json!({ "sender": "stdio-test" })),
             received_at: message.received_at,
@@ -255,7 +279,7 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
     );
 
     let init_params: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(init_params_path)?)?;
+        serde_json::from_str(&std::fs::read_to_string(&harness.init_params_path)?)?;
     assert_eq!(
         init_params["capabilities"]["extensions"][MCP_CHANNEL_CAPABILITY],
         serde_json::json!({})
@@ -267,7 +291,34 @@ async fn mcp_channel_manager_new_passes_sink_to_rmcp_and_advertises_extension() 
         None
     );
 
-    cancel_token.cancel();
+    harness.cancel_token.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_channel_manager_new_without_sink_does_not_advertise_extension() -> anyhow::Result<()>
+{
+    let harness = spawn_mcp_channel_test_manager(None).await?;
+
+    assert!(
+        harness
+            .manager
+            .wait_for_server_ready(MCP_CHANNEL_TEST_SERVER_NAME, Duration::from_secs(10))
+            .await,
+        "test MCP server should become ready"
+    );
+
+    let init_params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&harness.init_params_path)?)?;
+    assert_eq!(
+        init_params["capabilities"]
+            .get("extensions")
+            .and_then(|extensions| extensions.get(MCP_CHANNEL_CAPABILITY)),
+        None,
+        "missing sink must not advertise codex/channel capability"
+    );
+
+    harness.cancel_token.cancel();
     Ok(())
 }
 

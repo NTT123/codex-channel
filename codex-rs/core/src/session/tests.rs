@@ -7224,6 +7224,40 @@ async fn mcp_channel_message_with_trigger_does_not_wake_active_session() {
 }
 
 #[tokio::test]
+async fn mcp_channel_sink_is_disabled_for_subagent_session_source() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+
+    let sub_agent_sources = [
+        SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
+        SessionSource::SubAgent(SubAgentSource::Review),
+        SessionSource::SubAgent(SubAgentSource::Compact),
+        SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+    ];
+    for source in &sub_agent_sources {
+        let sink = super::mcp::mcp_channel_message_sink_for_session(&sess, source);
+        assert!(
+            sink.is_none(),
+            "sub-agent session ({source:?}) must not subscribe to channel notifications",
+        );
+    }
+
+    for root_source in [SessionSource::Cli, SessionSource::Exec, SessionSource::Mcp] {
+        let sink = super::mcp::mcp_channel_message_sink_for_session(&sess, &root_source);
+        assert!(
+            sink.is_some(),
+            "non-subagent session ({root_source:?}) must subscribe to channel notifications",
+        );
+    }
+}
+
+#[tokio::test]
 async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let communication = InterAgentCommunication::new(

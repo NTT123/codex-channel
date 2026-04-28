@@ -114,7 +114,13 @@ def configured_channel_message() -> tuple[str, dict[str, Any], bool]:
     return content, meta, trigger_turn
 
 
-def maybe_send_on_init() -> None:
+def maybe_send_on_init(client_advertised_channel: bool) -> None:
+    if not client_advertised_channel:
+        # Sub-agent sessions do not advertise codex/channel because only the
+        # root session subscribes. Stay running for tools/list etc., but skip
+        # the push so we don't fire notifications nobody will read.
+        log("client did not advertise codex/channel; skipping send-on-init")
+        return
     if not env_bool("CODEX_MCP_CHANNEL_SEND_ON_INIT", True):
         log("send-on-init disabled")
         return
@@ -146,6 +152,16 @@ def initialize_result() -> dict[str, Any]:
             "version": "0.1.0",
         },
     }
+
+
+def client_supports_channel(params: dict[str, Any]) -> bool:
+    capabilities = params.get("capabilities") or {}
+    if not isinstance(capabilities, dict):
+        return False
+    extensions = capabilities.get("extensions") or {}
+    if not isinstance(extensions, dict):
+        return False
+    return CHANNEL_CAPABILITY in extensions
 
 
 def tools_result() -> dict[str, Any]:
@@ -230,6 +246,7 @@ def handle_tool_call(request_id: Any, params: dict[str, Any]) -> None:
 
 def main() -> None:
     log("started")
+    client_advertised_channel = False
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -246,9 +263,10 @@ def main() -> None:
         params = message.get("params") or {}
 
         if method == "initialize":
+            client_advertised_channel = client_supports_channel(params)
             send_response(request_id, initialize_result())
         elif method == "notifications/initialized":
-            maybe_send_on_init()
+            maybe_send_on_init(client_advertised_channel)
         elif method == "tools/list":
             send_response(request_id, tools_result())
         elif method == "tools/call":

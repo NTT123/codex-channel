@@ -47,3 +47,17 @@ the automatic startup notification.
 
 The server also exposes a `send_channel_message` MCP tool. If startup sending is
 disabled, ask Codex to call that tool to send another test channel notification.
+
+## Sub-agent behavior
+
+Codex sub-agent sessions do not advertise the `codex/channel` client capability
+— only the root session subscribes to inbound notifications. This example
+inspects `params.capabilities.extensions` during `initialize` and, if
+`codex/channel` is absent, simply skips the startup push (and any future
+push triggered by `notifications/initialized`). The server stays connected so
+sub-agents can still call tools like `send_channel_message` to push outbound
+notifications back to the root.
+
+Avoid the alternative of refusing `initialize` outright: it surfaces as a
+startup failure that Codex logs every time a sub-agent spawns, and breaks
+sub-agent setup entirely if a user marks the server `required = true`.

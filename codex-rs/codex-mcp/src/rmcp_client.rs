@@ -56,6 +56,7 @@ use codex_rmcp_client::McpChannelNotificationParams;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::SendMcpChannelNotification;
 use codex_rmcp_client::StdioServerLauncher;
+use codex_rmcp_client::noop_send_mcp_channel_notification;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
@@ -92,10 +93,6 @@ impl McpChannelMessageSink {
         Self {
             send: Arc::new(send),
         }
-    }
-
-    pub fn noop() -> Self {
-        Self::new(|_| async {}.boxed())
     }
 
     async fn send(&self, message: InboundMcpChannelMessage) {
@@ -165,7 +162,7 @@ impl AsyncManagedClient {
         tool_plugin_provenance: Arc<ToolPluginProvenance>,
         runtime_environment: McpRuntimeEnvironment,
         runtime_auth_provider: Option<SharedAuthProvider>,
-        mcp_channel_message_sink: McpChannelMessageSink,
+        mcp_channel_message_sink: Option<McpChannelMessageSink>,
     ) -> Self {
         let tool_filter = ToolFilter::from_config(&config);
         let startup_snapshot = load_startup_cached_codex_apps_tools_snapshot(
@@ -354,8 +351,11 @@ fn server_supports_experimental_capability(
 
 pub(crate) fn mcp_channel_notification_sender(
     server_name: String,
-    sink: McpChannelMessageSink,
+    sink: Option<McpChannelMessageSink>,
 ) -> SendMcpChannelNotification {
+    let Some(sink) = sink else {
+        return noop_send_mcp_channel_notification();
+    };
     Box::new(move |params: McpChannelNotificationParams| {
         let server_name = server_name.clone();
         let sink = sink.clone();
@@ -486,7 +486,12 @@ async fn start_server_task(
     } = params;
     let elicitation = elicitation_capability_for_server(&server_name);
     let mut extensions = ExtensionCapabilities::new();
-    extensions.insert(MCP_CHANNEL_CAPABILITY.to_string(), Default::default());
+    // Advertise the inbound channel capability iff we have a sink to receive
+    // notifications. Callers that won't consume them (sub-agents, snapshot
+    // helpers) pass `None` so the server isn't asked to send into a void.
+    if mcp_channel_message_sink.is_some() {
+        extensions.insert(MCP_CHANNEL_CAPABILITY.to_string(), Default::default());
+    }
     let params = InitializeRequestParams {
         meta: None,
         capabilities: ClientCapabilities {
@@ -588,7 +593,7 @@ struct StartServerTaskParams {
     tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
-    mcp_channel_message_sink: McpChannelMessageSink,
+    mcp_channel_message_sink: Option<McpChannelMessageSink>,
 }
 
 async fn make_rmcp_client(

@@ -123,7 +123,7 @@ impl McpConnectionManager {
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
         auth: Option<&CodexAuth>,
-        mcp_channel_message_sink: McpChannelMessageSink,
+        mcp_channel_message_sink: Option<McpChannelMessageSink>,
     ) -> (Self, CancellationToken) {
         let cancel_token = CancellationToken::new();
         let mut clients = HashMap::new();
