@@ -24,6 +24,7 @@ use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC;
 use crate::rmcp_client::MCP_TOOLS_LIST_DURATION_METRIC;
 use crate::rmcp_client::ManagedClient;
+use crate::rmcp_client::McpChannelMessageSink;
 use crate::rmcp_client::StartupOutcomeError;
 use crate::rmcp_client::list_tools_for_client_uncached;
 use crate::runtime::McpRuntimeEnvironment;
@@ -122,6 +123,7 @@ impl McpConnectionManager {
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
         auth: Option<&CodexAuth>,
+        mcp_channel_message_sink: Option<McpChannelMessageSink>,
     ) -> (Self, CancellationToken) {
         let cancel_token = CancellationToken::new();
         let mut clients = HashMap::new();
@@ -181,6 +183,7 @@ impl McpConnectionManager {
                 Arc::clone(&tool_plugin_provenance),
                 runtime_environment.clone(),
                 runtime_auth_provider,
+                mcp_channel_message_sink.clone(),
             );
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
@@ -541,6 +544,13 @@ impl McpConnectionManager {
             .client_by_name(server)
             .await?
             .server_supports_sandbox_state_meta_capability)
+    }
+
+    pub async fn server_supports_mcp_channel_capability(&self, server: &str) -> Result<bool> {
+        Ok(self
+            .client_by_name(server)
+            .await?
+            .server_supports_mcp_channel_capability)
     }
 
     /// List resources from the specified server.

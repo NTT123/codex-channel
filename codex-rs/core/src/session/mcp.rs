@@ -203,7 +203,7 @@ impl Session {
     }
 
     async fn refresh_mcp_servers_inner(
-        &self,
+        self: &Arc<Self>,
         turn_context: &TurnContext,
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
@@ -245,6 +245,7 @@ impl Session {
             codex_apps_tools_cache_key(auth.as_ref()),
             tool_plugin_provenance,
             auth.as_ref(),
+            mcp_channel_message_sink_for_session(self, &turn_context.session_source),
         )
         .await;
         {
@@ -259,7 +260,10 @@ impl Session {
         *manager = refreshed_manager;
     }
 
-    pub(crate) async fn refresh_mcp_servers_if_requested(&self, turn_context: &TurnContext) {
+    pub(crate) async fn refresh_mcp_servers_if_requested(
+        self: &Arc<Self>,
+        turn_context: &TurnContext,
+    ) {
         let refresh_config = { self.pending_mcp_server_refresh_config.lock().await.take() };
         let Some(refresh_config) = refresh_config else {
             return;
@@ -293,7 +297,7 @@ impl Session {
     }
 
     pub(crate) async fn refresh_mcp_servers_now(
-        &self,
+        self: &Arc<Self>,
         turn_context: &TurnContext,
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
@@ -318,4 +322,28 @@ impl Session {
             .await
             .cancel();
     }
+}
+
+pub(super) fn mcp_channel_message_sink_for_session(
+    session: &Arc<Session>,
+    session_source: &SessionSource,
+) -> Option<codex_mcp::McpChannelMessageSink> {
+    // Sub-agents share the parent's MCP server set; if each one also subscribed
+    // to inbound channel notifications they would receive duplicates. Only the
+    // root session subscribes — if the root wants a sub-agent to act on a
+    // message, it forwards explicitly.
+    if matches!(session_source, SessionSource::SubAgent(_)) {
+        return None;
+    }
+    let weak_session = Arc::downgrade(session);
+    Some(codex_mcp::McpChannelMessageSink::new(move |message| {
+        let weak_session = weak_session.clone();
+        async move {
+            let Some(session) = weak_session.upgrade() else {
+                return;
+            };
+            session.handle_mcp_channel_message(message).await;
+        }
+        .boxed()
+    }))
 }

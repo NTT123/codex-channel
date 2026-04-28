@@ -19,7 +19,10 @@ use crate::logging_client_handler::LoggingClientHandler;
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::ElicitationPauseState;
 use crate::rmcp_client::ElicitationResponse;
+use crate::rmcp_client::MCP_CHANNEL_NOTIFICATION_METHOD;
+use crate::rmcp_client::McpChannelNotificationParams;
 use crate::rmcp_client::SendElicitation;
+use crate::rmcp_client::SendMcpChannelNotification;
 
 const MCP_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
 
@@ -27,6 +30,7 @@ const MCP_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
 pub(crate) struct ElicitationClientService {
     handler: LoggingClientHandler,
     send_elicitation: Arc<SendElicitation>,
+    send_mcp_channel_notification: Arc<SendMcpChannelNotification>,
     pause_state: ElicitationPauseState,
 }
 
@@ -34,6 +38,7 @@ impl ElicitationClientService {
     pub(crate) fn new(
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
+        send_mcp_channel_notification: SendMcpChannelNotification,
         pause_state: ElicitationPauseState,
     ) -> Self {
         let send_elicitation = Arc::new(send_elicitation);
@@ -43,6 +48,7 @@ impl ElicitationClientService {
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
             ),
             send_elicitation,
+            send_mcp_channel_notification: Arc::new(send_mcp_channel_notification),
             pause_state,
         }
     }
@@ -58,6 +64,34 @@ impl ElicitationClientService {
         (self.send_elicitation)(id, request)
             .await
             .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))
+    }
+
+    async fn handle_mcp_channel_notification(&self, notification: &ServerNotification) -> bool {
+        let ServerNotification::CustomNotification(notification) = notification else {
+            return false;
+        };
+        if notification.method != MCP_CHANNEL_NOTIFICATION_METHOD {
+            return false;
+        }
+
+        let params = match notification.params_as::<McpChannelNotificationParams>() {
+            Ok(Some(params)) => params,
+            Ok(None) => {
+                tracing::warn!(
+                    "MCP channel notification `{MCP_CHANNEL_NOTIFICATION_METHOD}` missing params"
+                );
+                return true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "failed to parse MCP channel notification `{MCP_CHANNEL_NOTIFICATION_METHOD}` params: {err}"
+                );
+                return true;
+            }
+        };
+
+        (self.send_mcp_channel_notification)(params).await;
+        true
     }
 }
 
@@ -94,6 +128,10 @@ impl Service<RoleClient> for ElicitationClientService {
         notification: ServerNotification,
         context: NotificationContext<RoleClient>,
     ) -> Result<(), rmcp::ErrorData> {
+        if self.handle_mcp_channel_notification(&notification).await {
+            return Ok(());
+        }
+
         <LoggingClientHandler as Service<RoleClient>>::handle_notification(
             &self.handler,
             notification,
@@ -152,13 +190,22 @@ fn elicitation_response_result(
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
     use pretty_assertions::assert_eq;
+    use rmcp::ServerHandler;
     use rmcp::model::BooleanSchema;
     use rmcp::model::CreateElicitationRequestParams;
+    use rmcp::model::CustomNotification;
     use rmcp::model::ElicitationSchema;
+    use rmcp::model::InitializeRequestParams;
     use rmcp::model::PrimitiveSchema;
+    use rmcp::model::ServerCapabilities;
+    use rmcp::model::ServerInfo;
+    use rmcp::model::ServerNotification;
+    use rmcp::service::ServiceExt;
     use serde_json::Value;
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -201,6 +248,169 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mcp_channel_notification_calls_callback_with_parsed_params() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service = service_with_channel_sender(Box::new(move |params| {
+            let tx = tx.clone();
+            async move {
+                tx.send(params).expect("receiver should be open");
+            }
+            .boxed()
+        }));
+
+        let consumed = service
+            .handle_mcp_channel_notification(&ServerNotification::CustomNotification(
+                CustomNotification::new(
+                    MCP_CHANNEL_NOTIFICATION_METHOD,
+                    Some(json!({
+                        "content": "hello",
+                        "metadata": { "sender": "alice" },
+                        "triggerTurn": false,
+                    })),
+                ),
+            ))
+            .await;
+
+        assert_eq!(consumed, true);
+        assert_eq!(
+            rx.recv().await.expect("callback should send params"),
+            McpChannelNotificationParams {
+                content: "hello".to_string(),
+                metadata: Some(json!({ "sender": "alice" })),
+                trigger_turn: false,
+            }
+        );
+        assert_eq!(rx.try_recv().is_err(), true);
+    }
+
+    #[tokio::test]
+    async fn mcp_channel_notification_accepts_meta_alias_and_defaults_trigger_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service = service_with_channel_sender(Box::new(move |params| {
+            let tx = tx.clone();
+            async move {
+                tx.send(params).expect("receiver should be open");
+            }
+            .boxed()
+        }));
+
+        let consumed = service
+            .handle_mcp_channel_notification(&ServerNotification::CustomNotification(
+                CustomNotification::new(
+                    MCP_CHANNEL_NOTIFICATION_METHOD,
+                    Some(json!({
+                        "content": "hello",
+                        "meta": { "channel": "support" },
+                    })),
+                ),
+            ))
+            .await;
+
+        assert_eq!(consumed, true);
+        assert_eq!(
+            rx.recv().await.expect("callback should send params"),
+            McpChannelNotificationParams {
+                content: "hello".to_string(),
+                metadata: Some(json!({ "channel": "support" })),
+                trigger_turn: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_mcp_channel_custom_notification_is_not_consumed() {
+        let service = service_with_channel_sender(Box::new(|_| {
+            async {
+                panic!("unknown notifications must not call channel callback");
+            }
+            .boxed()
+        }));
+
+        let consumed = service
+            .handle_mcp_channel_notification(&ServerNotification::CustomNotification(
+                CustomNotification::new("notifications/example", Some(json!({ "content": "hi" }))),
+            ))
+            .await;
+
+        assert_eq!(consumed, false);
+    }
+
+    #[tokio::test]
+    async fn malformed_mcp_channel_notification_is_consumed_without_callback() {
+        let service = service_with_channel_sender(Box::new(|_| {
+            async {
+                panic!("malformed notifications must not call channel callback");
+            }
+            .boxed()
+        }));
+
+        let consumed = service
+            .handle_mcp_channel_notification(&ServerNotification::CustomNotification(
+                CustomNotification::new(
+                    MCP_CHANNEL_NOTIFICATION_METHOD,
+                    Some(json!({ "metadata": { "sender": "alice" } })),
+                ),
+            ))
+            .await;
+
+        assert_eq!(consumed, true);
+    }
+
+    #[tokio::test]
+    async fn mcp_channel_notification_missing_params_is_consumed_without_callback() {
+        let service = service_with_channel_sender(Box::new(|_| {
+            async {
+                panic!("missing params notifications must not call channel callback");
+            }
+            .boxed()
+        }));
+
+        let consumed = service
+            .handle_mcp_channel_notification(&ServerNotification::CustomNotification(
+                CustomNotification::new(MCP_CHANNEL_NOTIFICATION_METHOD, None),
+            ))
+            .await;
+
+        assert_eq!(consumed, true);
+    }
+
+    #[tokio::test]
+    async fn mcp_channel_notification_reaches_callback_through_rmcp_service() -> anyhow::Result<()>
+    {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = ChannelNotificationServer.serve(server_transport).await?;
+            server.waiting().await?;
+            anyhow::Ok(())
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let service = service_with_channel_sender(Box::new(move |params| {
+            let tx = tx.clone();
+            async move {
+                tx.send(params).expect("receiver should be open");
+            }
+            .boxed()
+        }));
+        let client = service.serve(client_transport).await?;
+
+        let params = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await?
+            .expect("callback should send params");
+        client.cancel().await?;
+
+        assert_eq!(
+            params,
+            McpChannelNotificationParams {
+                content: "service hello".to_string(),
+                metadata: Some(json!({ "source": "server" })),
+                trigger_turn: true,
+            }
+        );
+        Ok(())
+    }
+
     fn form_request(meta: Option<Meta>) -> CreateElicitationRequestParams {
         CreateElicitationRequestParams::FormElicitationParams {
             meta,
@@ -217,5 +427,63 @@ mod tests {
             panic!("meta must be an object");
         };
         Meta(map)
+    }
+
+    fn service_with_channel_sender(
+        send_mcp_channel_notification: SendMcpChannelNotification,
+    ) -> ElicitationClientService {
+        ElicitationClientService::new(
+            form_client_info(),
+            Box::new(|_, _| async { panic!("elicitation should not be called") }.boxed()),
+            send_mcp_channel_notification,
+            ElicitationPauseState::new(),
+        )
+    }
+
+    fn form_client_info() -> ClientInfo {
+        InitializeRequestParams {
+            meta: None,
+            protocol_version: rmcp::model::ProtocolVersion::V_2025_06_18,
+            capabilities: Default::default(),
+            client_info: rmcp::model::Implementation {
+                name: "test-client".to_string(),
+                version: "0.0.0".to_string(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+            },
+        }
+    }
+
+    struct ChannelNotificationServer;
+
+    impl ServerHandler for ChannelNotificationServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo {
+                capabilities: ServerCapabilities::default(),
+                ..Default::default()
+            }
+        }
+
+        async fn on_initialized(
+            &self,
+            context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+        ) {
+            let peer = context.peer;
+            tokio::spawn(async move {
+                peer.send_notification(ServerNotification::CustomNotification(
+                    CustomNotification::new(
+                        MCP_CHANNEL_NOTIFICATION_METHOD,
+                        Some(json!({
+                            "content": "service hello",
+                            "meta": { "source": "server" },
+                        })),
+                    ),
+                ))
+                .await
+                .expect("send channel notification");
+            });
+        }
     }
 }

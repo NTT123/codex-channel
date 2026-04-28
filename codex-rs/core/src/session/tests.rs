@@ -3,6 +3,7 @@ use super::*;
 use crate::config::ConfigBuilder;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::McpChannelMessage;
 use crate::context::TurnAborted;
 use crate::exec::ExecCapturePolicy;
 use crate::function_tool::FunctionCallError;
@@ -4954,7 +4955,7 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
 
 #[tokio::test]
 async fn refresh_mcp_servers_is_deferred_until_next_turn() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let old_token = session.mcp_startup_cancellation_token().await;
     assert!(!old_token.is_cancelled());
 
@@ -7123,6 +7124,137 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert!(sess.has_trigger_turn_mailbox_items().await);
+}
+
+fn make_mcp_channel_message(content: &str, trigger_turn: bool) -> InboundMcpChannelMessage {
+    InboundMcpChannelMessage {
+        server_name: "slack".to_string(),
+        content: content.to_string(),
+        metadata: Some(json!({ "channel": "eng" })),
+        received_at: 1_726_000_001,
+        trigger_turn,
+    }
+}
+
+fn mcp_channel_response_input(message: &InboundMcpChannelMessage) -> ResponseInputItem {
+    ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: McpChannelMessage {
+                message: message.clone(),
+            }
+            .render(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn mcp_channel_message_without_trigger_waits_in_pending_input() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let message = make_mcp_channel_message("queued channel update", /*trigger_turn*/ false);
+
+    sess.handle_mcp_channel_message(message.clone()).await;
+
+    assert!(sess.active_turn.lock().await.is_none());
+    assert_eq!(
+        sess.get_pending_input().await,
+        vec![mcp_channel_response_input(&message)],
+    );
+}
+
+#[tokio::test]
+async fn mcp_channel_message_with_trigger_wakes_idle_session() {
+    let (sess, _tc, rx) = make_session_and_context_with_rx().await;
+    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = startup_prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+        ),
+    )
+    .await;
+    let message = make_mcp_channel_message("wake channel update", /*trigger_turn*/ true);
+
+    sess.handle_mcp_channel_message(message.clone()).await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("expected channel-triggered turn started event")
+        .expect("channel open");
+    assert!(matches!(first.msg, EventMsg::TurnStarted(_)));
+    assert_eq!(
+        sess.get_pending_input().await,
+        vec![mcp_channel_response_input(&message)],
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn mcp_channel_message_with_trigger_does_not_wake_active_session() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let existing_turn_state = {
+        let mut active = sess.active_turn.lock().await;
+        let active_turn = active.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&active_turn.turn_state)
+    };
+    let message = make_mcp_channel_message("active channel update", /*trigger_turn*/ true);
+
+    sess.handle_mcp_channel_message(message.clone()).await;
+
+    let current_turn_state = {
+        let active = sess.active_turn.lock().await;
+        Arc::clone(
+            &active
+                .as_ref()
+                .expect("active turn should remain present")
+                .turn_state,
+        )
+    };
+    assert!(Arc::ptr_eq(&existing_turn_state, &current_turn_state));
+    assert_eq!(
+        sess.get_pending_input().await,
+        vec![mcp_channel_response_input(&message)],
+    );
+}
+
+#[tokio::test]
+async fn mcp_channel_sink_is_disabled_for_subagent_session_source() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+
+    let sub_agent_sources = [
+        SessionSource::SubAgent(SubAgentSource::Other("test".to_string())),
+        SessionSource::SubAgent(SubAgentSource::Review),
+        SessionSource::SubAgent(SubAgentSource::Compact),
+        SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+    ];
+    for source in &sub_agent_sources {
+        let sink = super::mcp::mcp_channel_message_sink_for_session(&sess, source);
+        assert!(
+            sink.is_none(),
+            "sub-agent session ({source:?}) must not subscribe to channel notifications",
+        );
+    }
+
+    for root_source in [SessionSource::Cli, SessionSource::Exec, SessionSource::Mcp] {
+        let sink = super::mcp::mcp_channel_message_sink_for_session(&sess, &root_source);
+        assert!(
+            sink.is_some(),
+            "non-subagent session ({root_source:?}) must subscribe to channel notifications",
+        );
+    }
 }
 
 #[tokio::test]

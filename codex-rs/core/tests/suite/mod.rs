@@ -54,6 +54,7 @@ mod items;
 mod json_result;
 mod live_cli;
 mod live_reload;
+mod mcp_channel;
 mod memories;
 mod model_overrides;
 mod model_switching;

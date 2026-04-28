@@ -932,6 +932,10 @@ impl Session {
                 codex_apps_tools_cache_key(auth),
                 tool_plugin_provenance,
                 auth,
+                super::mcp::mcp_channel_message_sink_for_session(
+                    &sess,
+                    &session_configuration.session_source,
+                ),
             )
             .instrument(info_span!(
                 "session_init.mcp_manager_init",

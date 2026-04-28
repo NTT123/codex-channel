@@ -340,6 +340,24 @@ fn legacy_inter_agent_assistant_messages_are_not_turn_boundaries() {
 }
 
 #[test]
+fn mcp_channel_messages_are_contextual_not_user_turn_boundaries() {
+    let item = user_input_text_msg(
+        "<mcp_channel_message>{\"server_name\":\"slack\",\"content\":\"hello\",\"metadata\":{\"thread\":\"abc\"},\"received_at\":1726000001}</mcp_channel_message>",
+    );
+
+    assert!(!is_user_turn_boundary(&item));
+
+    let mut history = create_history_with_items(vec![
+        item.clone(),
+        user_input_text_msg("real user turn"),
+        assistant_msg("assistant reply"),
+    ]);
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+}
+
+#[test]
 fn total_token_usage_includes_all_items_after_last_model_generated_item() {
     let mut history = create_history_with_items(vec![assistant_msg("already counted by API")]);
     history.update_token_info(

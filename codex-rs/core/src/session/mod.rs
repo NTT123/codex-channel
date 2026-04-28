@@ -90,6 +90,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::mcp_channel::InboundMcpChannelMessage;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
@@ -3077,6 +3078,21 @@ impl Session {
 
     pub(crate) fn enqueue_mailbox_communication(&self, communication: InterAgentCommunication) {
         self.mailbox.send(communication);
+    }
+
+    pub(crate) fn enqueue_mcp_channel_message(&self, message: InboundMcpChannelMessage) {
+        self.mailbox.send(message);
+    }
+
+    pub(crate) async fn handle_mcp_channel_message(
+        self: &Arc<Self>,
+        message: InboundMcpChannelMessage,
+    ) {
+        let trigger_turn = message.trigger_turn;
+        self.enqueue_mcp_channel_message(message);
+        if trigger_turn {
+            self.maybe_start_turn_for_pending_work().await;
+        }
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
